@@ -81,6 +81,15 @@ async def get_management_chain(person_id):
     return await hcm_client.get_management_chain(_cfg(c), person_id)
 
 
+async def team_goals(person_id):
+    c = _primary()
+    if not c:
+        return []
+    if c["type"] == "mock":
+        return mock_data.team_goals(person_id)
+    return await hcm_client.team_goals(_cfg(c), person_id)
+
+
 async def overview():
     c = _primary()
     if not c:

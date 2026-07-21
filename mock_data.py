@@ -52,6 +52,19 @@ def list_by_department(department):
     return [_LIGHT(w) for w in WORKERS if q in str(w.get("DepartmentName","")).lower() or str(w.get("DepartmentName","")).lower() in q]
 
 
+def team_goals(person_id):
+    """Offline stand-in for the manager fan-out."""
+    out = []
+    for r in get_direct_reports(person_id):
+        pn = r.get("PersonNumber")
+        out.append({"PersonNumber": pn, "DisplayName": r.get("DisplayName"), "GoalCount": 2,
+                    "Goals": [{"Goal": "Deliver Q3 roadmap", "Progress": "60",
+                               "Target": "2026-09-30", "Status": "In progress"},
+                              {"Goal": "Mentor a junior engineer", "Progress": "100",
+                               "Target": "2026-06-30", "Status": "Completed"}]})
+    return out
+
+
 def run_custom(cfg, args):
     """Mock executor for CONFIG tools so UI-added tools are demonstrably callable offline."""
     kind = cfg.get("kind"); name = cfg.get("name", "tool")
@@ -65,6 +78,17 @@ def run_custom(cfg, args):
         return [dict(base, sample=f"{name} row 1"), dict(base, sample=f"{name} row 2")]
     if kind == "oracle_detail":
         return dict(base, detail=f"{name} sample value")
+    if kind == "oracle_resource":
+        res = cfg.get("endpoint") or ""
+        if "earning" in res:
+            return [{"Course": "Security Awareness 2026", "Type": "Course", "Status": "Completed",
+                     "Due": "2026-03-31", "Completed": "2026-03-02", "Score": "92"},
+                    {"Course": "Leading Hybrid Teams", "Type": "Specialization",
+                     "Status": "In progress", "Due": "2026-09-30", "Completed": None, "Score": None}]
+        return [{"Goal": "Deliver Q3 roadmap", "Progress": "60", "Target": "2026-09-30",
+                 "Status": "In progress", "Weight": "40", "Plan": "FY26 Goal Plan"},
+                {"Goal": "Mentor a junior engineer", "Progress": "100", "Target": "2026-06-30",
+                 "Status": "Completed", "Weight": "20", "Plan": "FY26 Goal Plan"}]
     if kind == "external":
         # offline stand-in so an external tool is demonstrably callable without the
         # third-party system; echoes the call rather than pretending it succeeded.

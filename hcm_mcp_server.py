@@ -27,7 +27,12 @@ _sync_lock = threading.Lock()   # serialize mutations of the shared MCP server
 
 
 def _clean(items):
-    return [{k: v for k, v in it.items() if not k.startswith("_")} for it in (items or [])]
+    # denials and error paths can hand back a dict; pass those through untouched
+    # rather than iterating them as if they were rows.
+    if not isinstance(items, (list, tuple)):
+        return items
+    return [{k: v for k, v in it.items() if not k.startswith("_")} if isinstance(it, dict) else it
+            for it in items]
 
 
 def _source_name() -> str:
@@ -95,6 +100,14 @@ async def list_by_department(department: str) -> list:
 async def get_management_chain(person_id: str) -> list:
     """The management chain above a worker, immediate manager first up to the top."""
     return _clean(await _run("get_management_chain", sources.get_management_chain(person_id), person_id))
+
+
+@mcp.tool
+async def get_team_goals(person_id: str) -> list:
+    """Goals of a manager's direct reports, grouped per person. Oracle has no
+    manager-scoped goals finder, so this fans out: direct reports, then each
+    report's goals."""
+    return _clean(await _run("get_team_goals", sources.team_goals(person_id), person_id))
 
 
 class _ConfigTool(Tool):

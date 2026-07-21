@@ -18,13 +18,21 @@ import config
 
 ALL_ROLES = "employee,manager,hr_admin"
 ROLES = ("employee", "manager", "hr_admin")
-KINDS = ("builtin", "oracle_search", "oracle_child", "oracle_detail", "external")
+KINDS = ("builtin", "oracle_search", "oracle_child", "oracle_detail",
+         "oracle_resource", "external")
 METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
 ARG_TYPES = ("string", "integer", "number", "boolean")
 
 # The 6 tools that have hardcoded implementations (never dynamically registered).
+# Builtins that return a LIST. A denial must hand back [] for these, not an error
+# dict, or callers that iterate the result blow up on a permission check. Keep in
+# step with the return annotations in hcm_mcp_server.
+LIST_BUILTINS = {"search_workers", "get_direct_reports", "list_by_department",
+                 "get_management_chain", "get_team_goals"}
+
 BUILTIN_NAMES = {"search_workers", "get_worker", "get_assignment",
-                 "get_direct_reports", "list_by_department", "get_management_chain"}
+                 "get_direct_reports", "list_by_department", "get_management_chain",
+                 "get_team_goals"}
 
 # name, source, enabled, roles, ttl, pii, ns, desc, rest_mapping, kind, method, endpoint, params, result_map, arg, builtin
 _SEED = [
@@ -52,12 +60,48 @@ _SEED = [
      "GET .../workers/{id}/child/salaries", "oracle_child", "GET", "salaries",
      '{"onlyData":"true","limit":5}', '{"Salary":"SalaryAmount","Currency":"CurrencyCode","Basis":"SalaryBasisName"}',
      "person_id", 0),
+    ("get_team_goals", "oracle_hcm", 1, "manager,hr_admin", 300, "medium", 0,
+     "Goals for everyone reporting to a manager, grouped per person. Use for "
+     "'how is my team tracking', 'show my team's goals'.",
+     "direct reports, then performanceGoalsV2 per report", "builtin", "GET", "",
+     "{}", "{}", "person_id", 1),
+    # --- Goals & Learning (top-level Fusion resources, verified against a live pod) ---
+    ("get_goals", "oracle_hcm", 1, ALL_ROLES, 300, "medium", 0,
+     "A worker's performance goals: name, progress %, target date, weight, goal plan. "
+     "Use for 'my goals', 'how am I tracking', 'what are Priya's goals'.",
+     "GET .../performanceGoalsV2?q=PersonNumber='{n}'", "oracle_resource", "GET", "performanceGoalsV2",
+     '{"attr":"PersonNumber","limit":50,'
+     '"fields":"GoalName,Description,StatusMeaning,PercentCompletion,StartDate,TargetCompletionDate,'
+     'Weighting,CategoryMeaning,LevelMeaning,PriorityMeaning,GoalPlanName,ReviewPeriodName"}',
+     '{"Goal":"GoalName","Progress":"PercentCompletion","Target":"TargetCompletionDate",'
+     '"Status":"StatusMeaning","Weight":"Weighting","Category":"CategoryMeaning","Plan":"GoalPlanName"}',
+     "person_number", 0),
+    ("get_development_goals", "oracle_hcm", 1, ALL_ROLES, 300, "medium", 0,
+     "A worker's development goals (growth/learning objectives), with success criteria and priority.",
+     "GET .../developmentGoals?q=PersonNumber='{n}'", "oracle_resource", "GET", "developmentGoals",
+     '{"attr":"PersonNumber","limit":50,'
+     '"fields":"GoalName,Description,StatusMeaning,PercentComplete,StartDate,TargetCompletionDate,'
+     'CategoryMeaning,PriorityMeaning,LevelMeaning,SuccessCriteria"}',
+     '{"Goal":"GoalName","Progress":"PercentComplete","Target":"TargetCompletionDate",'
+     '"Status":"StatusMeaning","Priority":"PriorityMeaning","SuccessCriteria":"SuccessCriteria"}',
+     "person_number", 0),
+    ("get_learning", "oracle_hcm", 1, ALL_ROLES, 300, "medium", 0,
+     "A worker's learning records: assigned courses, status, due date, completion date and score. "
+     "Use for 'my training', 'what learning is overdue', 'did Sam finish the course'.",
+     "GET .../learnerLearningRecords?q=assignedToNumber='{n}'", "oracle_resource", "GET",
+     "learnerLearningRecords",
+     '{"attr":"assignedToNumber","limit":50,'
+     '"fields":"learningItemTitle,learningItemTypeMeaning,assignmentStatusMeaning,assignmentDueDate,'
+     'completedDate,actualScore,assignmentTypeMeaning,assignedDate"}',
+     '{"Course":"learningItemTitle","Type":"learningItemTypeMeaning","Status":"assignmentStatusMeaning",'
+     '"Due":"assignmentDueDate","Completed":"completedDate","Score":"actualScore"}',
+     "person_number", 0),
     ("snow_raise_case", "servicenow", 0, ALL_ROLES, 0, "low", 1,
      "Raise an HR case in ServiceNow (namespaced external tool). Needs a ServiceNow source.",
      "POST /api/now/table/hr_case", "external", "POST", "hr_case", "{}", "{}", "query", 0),
 ]
 
-_LIST_KINDS = {"oracle_search", "oracle_child"}
+_LIST_KINDS = {"oracle_search", "oracle_child", "oracle_resource"}
 _repaired = False
 
 
@@ -123,6 +167,20 @@ def _seed(c):
     c.commit()
 
 
+def _backfill(c):
+    """_seed only fires on an empty table, so a database created before these tools
+    existed would never get them. Insert any seed row whose name is missing."""
+    have = {r[0] for r in c.execute("SELECT name FROM tools")}
+    new = [s for s in _SEED if s[0] not in have]
+    if not new:
+        return
+    c.executemany("INSERT INTO tools(name,source_type,enabled,allowed_roles,cache_ttl,pii_level,"
+                  "namespaced,description,rest_mapping,kind,method,endpoint,params,result_map,arg,builtin) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", new)
+    c.commit()
+    print("[tools] added:", ", ".join(s[0] for s in new))
+
+
 def _jload(s, default):
     try:
         return json.loads(s) if s else default
@@ -183,7 +241,7 @@ def json_schema(t: dict) -> dict:
 
 
 def list_all() -> list:
-    c = _conn(); _seed(c)
+    c = _conn(); _seed(c); _backfill(c)
     rows = c.execute(f"SELECT {_COLS} FROM tools ORDER BY builtin DESC, namespaced, name").fetchall()
     c.close()
     return [_row(r) for r in rows]
@@ -308,8 +366,7 @@ def check(name: str, role: str) -> tuple[bool, str]:
 
 def deny_value(name: str):
     t = get(name)
-    if (t and t["kind"] in _LIST_KINDS) or name in ("search_workers", "get_direct_reports",
-                                                    "list_by_department", "get_management_chain"):
+    if (t and t["kind"] in _LIST_KINDS) or name in LIST_BUILTINS:
         return []
     return {"error": "not_permitted",
             "message": "This action isn't available for your role or is disabled."}

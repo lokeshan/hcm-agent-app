@@ -375,6 +375,8 @@ async def run_custom(conn, cfg: dict, args: dict):
                     gp["expand"] = p["expand"]
                 d = await _get(conn, href, gp)
                 out = _apply_map(d, rmap)
+        elif kind == "oracle_resource":
+            out = await _resource(conn, cfg, p, rmap, argval)
         elif kind == "external":
             out = await _external(conn, cfg, args, p, rmap, method)
         else:
@@ -383,6 +385,57 @@ async def run_custom(conn, cfg: dict, args: dict):
         return {"error": f"{type(e).__name__}: {e}"}
     if ttl and reads and _cache_on():
         cache.set(ck, out, ttl)
+    return out
+
+
+async def _resource(conn, cfg, p, rmap, argval):
+    """Query a TOP-LEVEL Fusion resource filtered to one person.
+
+    Goals and Learning are not children of /workers, so oracle_child can't reach them.
+    The resource name and the filter attribute are both whitelisted to [A-Za-z0-9_]
+    before they touch the URL or the q string."""
+    res = re.sub(r"[^A-Za-z0-9_]", "", cfg.get("endpoint") or "")
+    if not res:
+        return {"error": "bad_endpoint", "message": "resource name required"}
+    attr = re.sub(r"[^A-Za-z0-9_.]", "", str(p.get("attr", "PersonNumber"))) or "PersonNumber"
+    if p.get("quote") is False:      # numeric ids go unquoted; strip to digits so the
+        v = re.sub(r"[^0-9]", "", str(argval or ""))   # value can't break out of the filter
+        if not v:
+            return []
+        q = f"{attr}={v}"
+    else:
+        q = f"{attr}='{_qesc(argval)}'"
+    gp = {"q": q, "onlyData": "true", "limit": p.get("limit", 50)}
+    if p.get("fields"):
+        gp["fields"] = p["fields"]
+    d = await _get(conn, f"/hcmRestApi/resources/latest/{res}", gp)
+    return [_apply_map(w, rmap) for w in d.get("items", [])]
+
+
+async def team_goals(conn, person_id: str, resource: str = "performanceGoalsV2", per: int = 10):
+    """A manager's team goals: direct reports, then each report's goals.
+
+    Oracle exposes no manager- or hierarchy-scoped finder on any goals resource
+    (confirmed against both the docs and a live pod), so this is necessarily a fan-out.
+    ponytail: sequential N+1, capped at 25 reports — parallelise if a wide span is slow.
+    """
+    reports = await get_direct_reports(conn, person_id)
+    out = []
+    for r in reports[:25]:
+        pn = r.get("PersonNumber")
+        goals = []
+        if pn:
+            try:
+                goals = await _resource(
+                    conn, {"endpoint": resource},
+                    {"attr": "PersonNumber", "limit": per,
+                     "fields": "GoalName,PercentCompletion,TargetCompletionDate,StatusMeaning"},
+                    {"Goal": "GoalName", "Progress": "PercentCompletion",
+                     "Target": "TargetCompletionDate", "Status": "StatusMeaning"}, pn)
+            except Exception as e:
+                goals = [{"error": f"{type(e).__name__}"}]
+        out.append({"PersonNumber": pn, "DisplayName": r.get("DisplayName"),
+                    "GoalCount": len(goals), "Goals": goals})
     return out
 
 

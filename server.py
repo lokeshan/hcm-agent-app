@@ -873,7 +873,7 @@ def _tool_form(t):
     aschema = json.dumps(registry.args_of(t)) if t else \
         '[{"name": "person_id", "type": "string", "required": true, "description": ""}]'
     adv = "" if builtin else (
-        f'<label>Kind</label>{sel("kind", ["oracle_child", "oracle_search", "oracle_detail", "external"], t["kind"] if t else "oracle_child")}'
+        f'<label>Kind</label>{sel("kind", ["oracle_child", "oracle_search", "oracle_detail", "oracle_resource", "external"], t["kind"] if t else "oracle_child")}'
         f'<label>HTTP method — <span class="mono">external</span> tools only. Anything other than '
         f'<span class="mono">GET</span> is a write: it is never cached, and the agent can call it '
         f'on its own, so grant it narrowly.</label>{sel("method", list(registry.METHODS), t["method"] if t else "GET")}'
@@ -881,9 +881,10 @@ def _tool_form(t):
         f'<span class="mono">{{"name","type","required","description"}}</span>. '
         f'The description is what the model reads to fill the argument in.</label>'
         f'<textarea name="args_schema" rows="3" class="mono">{ui.esc(aschema)}</textarea>'
-        f'<label>Endpoint — child resource for oracle_child (e.g. <span class="mono">absences</span>, '
-        f'<span class="mono">salaries</span>, <span class="mono">phones</span>); for '
-        f'<span class="mono">external</span>, a path under the source&#39;s base URL '
+        f'<label>Endpoint — child resource for oracle_child (e.g. <span class="mono">absences</span>); '
+        f'a TOP-LEVEL resource name for oracle_resource (e.g. '
+        f'<span class="mono">performanceGoalsV2</span>, <span class="mono">learnerLearningRecords</span>); '
+        f'for <span class="mono">external</span>, a path under the source&#39;s base URL '
         f'(e.g. <span class="mono">api/now/table/hr_case</span>)</label>'
         f'<input name="endpoint" value="{ui.esc(t["endpoint"]) if t else ""}">'
         f'<label>Params (JSON)</label><textarea name="params" rows="2" class="mono">{ui.esc(params)}</textarea>'
