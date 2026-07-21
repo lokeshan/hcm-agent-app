@@ -1,0 +1,12 @@
+[project]
+name = "hr-assistant-hcm"
+version = "1.0.0"
+description = "AI HR assistant on Oracle HCM — two-app FastAPI platform with governed, config-driven MCP tools"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+readme = "README.md"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+python_files = ["test_*.py"]
+testpaths = ["tests"]

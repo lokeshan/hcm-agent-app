@@ -1,0 +1,11 @@
+# HR Assistant platform — one backend, two apps (End-User + Admin Console)
+# Upper bounds pin major versions; regenerate a full lock from your venv with:
+#   pip freeze > requirements.lock
+pydantic-ai-slim[google,openai,anthropic,mcp]>=2.13,<3   # agent + Google/OpenAI/Anthropic + MCP
+fastmcp>=3.4,<4                                            # in-process Oracle HCM MCP server
+fastapi>=0.110,<1                                         # backend + both front-ends (server.py)
+uvicorn>=0.27,<1                                          # ASGI server
+python-multipart>=0.0.9,<1                                # form posts (admin console)
+httpx>=0.27,<1                                             # live Oracle HCM REST calls
+truststore>=0.9,<1                                        # trust OS/corporate CA (enterprise SSL)
+python-dotenv>=1.0,<2                                      # load .env at startup

@@ -1,0 +1,17 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile *.py
+      - name: Test suite
+        run: |
+          for t in conformance_audit test_roles test_migration test_security test_e2e; do
+            echo "== $t =="; python tests/$t.py || exit 1
+          done

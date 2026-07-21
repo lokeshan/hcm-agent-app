@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.chainlit/
+.files/
+
+config.json
+hcm_agent.db
+*.db
+
+# generated artifacts / scratch
+demo_transcript.json
+preview/
+HR_Assistant.html
+HR_Assistant_demo.png
+*.png
+.secret_key
+raw_findings.md
