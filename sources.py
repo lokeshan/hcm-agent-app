@@ -90,16 +90,29 @@ async def overview():
     return await hcm_client.overview(_cfg(c))
 
 
+def _by_type(t):
+    return next((c for c in connectors.enabled_list() if c["type"] == t), None)
+
+
 async def run_custom(name, **args):
-    """Execute a CONFIG (UI-defined) tool through the primary connector."""
-    c = _primary()
-    if not c:
-        return {"error": "no_source"}
+    """Execute a CONFIG (UI-defined) tool.
+
+    Oracle-kind tools run through the primary connector. `external` tools run through
+    a connector of their own source_type instead, so a ServiceNow tool talks to
+    ServiceNow even while Oracle HCM is primary."""
     cfg = tools_registry.get(name)
     if not cfg:
         return {"error": "unknown_tool"}
-    if c["type"] == "mock":
-        return mock_data.run_custom(cfg, args)
+    c = _primary()
+    if c and c["type"] == "mock":
+        return mock_data.run_custom(cfg, args)      # offline demo: mock everything
+    if cfg["kind"] == "external":
+        ext = _by_type(cfg["source_type"])
+        if not ext:
+            return {"error": "no_source", "source_type": cfg["source_type"]}
+        return await hcm_client.run_custom(_cfg(ext), cfg, args)
+    if not c:
+        return {"error": "no_source"}
     return await hcm_client.run_custom(_cfg(c), cfg, args)
 
 
@@ -117,4 +130,7 @@ async def role_signals(person_id):
 async def test(connector: dict) -> dict:
     if connector["type"] == "mock":
         return {"ok": True, "status": 200, "count": len(mock_data.WORKERS)}
+    if connector["type"] == "external_mcp":
+        import mcp_sources                      # local import: keeps the MCP client off
+        return await mcp_sources.test(connector)  # the import path of every other source
     return await hcm_client.test_connection(_cfg(connector))

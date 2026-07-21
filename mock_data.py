@@ -57,13 +57,19 @@ def run_custom(cfg, args):
     kind = cfg.get("kind"); name = cfg.get("name", "tool")
     if kind == "oracle_search":
         return search_workers(args.get("query", ""))
-    pid = args.get(cfg.get("arg", "person_id"), args.get("person_id"))
+    pid = (args.get(cfg.get("arg", "person_id")) or args.get("person_id")
+           or next(iter(args.values()), None))
     w = _BY_ID.get(str(pid)) or _BY_NUM.get(str(pid))
     base = {"PersonId": pid, "DisplayName": (w or {}).get("DisplayName")}
     if kind == "oracle_child":
         return [dict(base, sample=f"{name} row 1"), dict(base, sample=f"{name} row 2")]
     if kind == "oracle_detail":
         return dict(base, detail=f"{name} sample value")
+    if kind == "external":
+        # offline stand-in so an external tool is demonstrably callable without the
+        # third-party system; echoes the call rather than pretending it succeeded.
+        return {"mocked": True, "tool": name, "args": args,
+                "would_call": f"{cfg.get('method', 'GET')} /{str(cfg.get('endpoint') or '').lstrip('/')}"}
     return {"error": "unsupported_kind", "kind": kind}
 
 

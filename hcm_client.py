@@ -91,16 +91,23 @@ async def _auth(conn):
     return {}, (conn.get("username", ""), conn.get("password", ""))
 
 
-async def _get(conn, url_or_path, params=None):
+async def _request(conn, method, url_or_path, params=None, json_body=None):
+    """_get for any verb. Keeps the no-redirect rule: a 3xx on an authenticated call
+    usually means the credentials were refused, and following it would resend them
+    to wherever the redirect points."""
     url = url_or_path if url_or_path.startswith("http") else _base(conn) + url_or_path
     headers, auth = await _auth(conn)
     headers["Accept"] = "application/json"
     async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=False) as c:
-        r = await c.get(url, params=params, headers=headers, auth=auth)
+        r = await c.request(method, url, params=params, json=json_body, headers=headers, auth=auth)
         if 300 <= r.status_code < 400:
             raise RuntimeError(f"Redirected (HTTP {r.status_code}) — check credentials / auth type.")
         r.raise_for_status()
-        return r.json()
+        return r.json() if (r.content or b"").strip() else {}
+
+
+async def _get(conn, url_or_path, params=None):
+    return await _request(conn, "GET", url_or_path, params=params)
 
 
 def _self(item):
@@ -324,10 +331,16 @@ async def run_custom(conn, cfg: dict, args: dict):
     Lets admins add new Oracle tools from the UI with no code."""
     kind = cfg.get("kind"); p = dict(cfg.get("params") or {}); rmap = cfg.get("result_map") or {}
     ttl = int(cfg.get("cache_ttl") or 0)
+    method = str(cfg.get("method") or "GET").upper()
     arg = cfg.get("arg", "person_id")
     argval = args.get(arg, args.get("person_id", args.get("query")))
-    ck = _ck(conn, "custom", cfg.get("name", ""), str(argval))
-    if ttl and _cache_on():
+    # EVERY argument goes into the cache key. Keying on a single one (as this did
+    # while tools took a single argument) makes two different calls to the same
+    # multi-argument tool collide and serve each other's rows.
+    sig = ";".join(f"{k}={args[k]}" for k in sorted(args))
+    ck = _ck(conn, "custom", cfg.get("name", ""), sig)
+    reads = method == "GET"          # never cache a write, whatever TTL says
+    if ttl and reads and _cache_on():
         cached = cache.get(ck)
         if cached is not None:
             return cached
@@ -362,13 +375,39 @@ async def run_custom(conn, cfg: dict, args: dict):
                     gp["expand"] = p["expand"]
                 d = await _get(conn, href, gp)
                 out = _apply_map(d, rmap)
+        elif kind == "external":
+            out = await _external(conn, cfg, args, p, rmap, method)
         else:
             out = {"error": "unsupported_kind", "kind": kind}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
-    if ttl and _cache_on():
+    if ttl and reads and _cache_on():
         cache.set(ck, out, ttl)
     return out
+
+
+async def _external(conn, cfg, args, p, rmap, method):
+    """Generic REST call against a non-Oracle source (ServiceNow, a KB, ...).
+
+    The endpoint is always joined onto the connector's base_url and never used as an
+    absolute URL, so a tool definition cannot be pointed at an arbitrary host — the
+    admin who configures the *source* decides which server is reachable, not the
+    admin who configures the tool."""
+    ep = str(cfg.get("endpoint") or "").strip()
+    if "://" in ep or ep.startswith("//"):
+        return {"error": "bad_endpoint", "message": "endpoint must be a path, not a full URL"}
+    payload = {**p, **args}
+    d = await _request(conn, method, "/" + ep.lstrip("/"),
+                       params=payload if method == "GET" else None,
+                       json_body=None if method == "GET" else payload)
+    if isinstance(d, list):
+        return [_apply_map(x, rmap) for x in d]
+    if isinstance(d, dict):
+        items = d.get("items") if isinstance(d.get("items"), list) else d.get("result")
+        if isinstance(items, list):
+            return [_apply_map(x, rmap) for x in items]
+        return _apply_map(d, rmap)
+    return {"result": d}
 
 
 async def role_signals(conn, person_id: str) -> dict:

@@ -29,10 +29,13 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Plai
 
 import json
 import config, connectors, conn_types, sources, identity as idmod
+import mcp_sources
 import tools_registry as registry
 import users_store, role_rules, audit_store, cache, models as models_mod
 import webui as ui
 from agent import build_agent, active_mode
+from pydantic_ai import DeferredToolRequests, DeferredToolResults
+
 from hcm_mcp_server import sync_custom_tools
 
 app = FastAPI(title="HR Assistant Platform")
@@ -350,13 +353,23 @@ const CSRF=(document.getElementById('csrf')||{}).value||'';
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function add(cls,html,meta){const d=document.createElement('div');d.className='msg '+cls;
  d.innerHTML='<div class="bub">'+html+'</div>'+(meta?'<div class="meta">'+esc(meta)+'</div>':'');log.appendChild(d);log.scrollTop=log.scrollHeight;}
-async function ask(){const q=inp.value.trim();if(!q)return;add('u',esc(q));inp.value='';btn.disabled=true;
+function confirmCard(a){const d=document.createElement('div');d.className='msg a';
+ d.innerHTML='<div class="bub">⚠️ <b>'+esc(a.tool)+'</b> will <b>change data</b> in a connected system.<br>'
+  +'<span class="mono">'+esc(JSON.stringify(a.args))+'</span><br><br>'
+  +'<button class="btn sm">Approve</button> <button class="btn sm grey">Cancel</button></div>';
+ const b=d.querySelectorAll('button');
+ b[0].onclick=function(){d.remove();send({approvals:{[a.id]:true}});};
+ b[1].onclick=function(){d.remove();send({approvals:{[a.id]:false}});};
+ log.appendChild(d);log.scrollTop=log.scrollHeight;}
+async function send(payload){btn.disabled=true;
  add('a','<i>thinking…</i>');const ph=log.lastChild;
- try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:JSON.stringify({message:q})});
+ try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':CSRF},body:JSON.stringify(payload)});
  const j=await r.json();ph.remove();
  const meta=(j.tools&&j.tools.length)?('🔧 '+j.tools.join(', ')+' · '+(j.source||'')):'';
- add('a',esc(j.answer||j.error||'(no answer)').replace(/\\n/g,'<br>'),meta);}
+ if(j.approvals&&j.approvals.length){j.approvals.forEach(confirmCard);}
+ else{add('a',esc(j.answer||j.error||'(no answer)').replace(/\\n/g,'<br>'),meta);}}
  catch(e){ph.remove();add('a',esc('⚠️ '+e));}finally{btn.disabled=false;inp.focus();}}
+async function ask(){const q=inp.value.trim();if(!q)return;add('u',esc(q));inp.value='';send({message:q});}
 inp.addEventListener('keydown',e=>{if(e.key==='Enter')ask();});
 </script>"""
 
@@ -522,7 +535,10 @@ async def api_chat(request: Request):
         return JSONResponse({"error": "Not signed in."}, status_code=401)
     data = await request.json()
     msg = (data.get("message") or "").strip()
-    if not msg:
+    # Resuming a paused run: the body carries {tool_call_id: bool} instead of a message.
+    raw = data.get("approvals")
+    approvals = {str(k): bool(v) for k, v in raw.items()} if isinstance(raw, dict) else None
+    if not msg and not approvals:
         return JSONResponse({"error": "Empty message."}, status_code=400)
     if len(msg) > MAX_MSG_LEN:
         return JSONResponse({"error": "Message too long."}, status_code=413)
@@ -531,11 +547,19 @@ async def api_chat(request: Request):
     try:
         agent = build_agent(identity=u)
         async with agent:
-            result = await agent.run(msg, message_history=hist)
+            result = await agent.run(
+                msg or None, message_history=hist,
+                deferred_tool_results=DeferredToolResults(approvals=approvals) if approvals else None)
         if s is not None:
             s["history"] = result.all_messages()[-MAX_HISTORY:]
-        return JSONResponse({"answer": result.output, "tools": _tools_used(result.all_messages()),
-                             "source": (connectors.primary() or {}).get("name", "")})
+        tools, src = _tools_used(result.all_messages()), (connectors.primary() or {}).get("name", "")
+        if isinstance(result.output, DeferredToolRequests):
+            # the run stopped to ask; hand the pending writes to the UI to confirm
+            return JSONResponse({"answer": "", "tools": tools, "source": src,
+                                 "approvals": [{"id": c.tool_call_id, "tool": c.tool_name,
+                                                "args": c.args_as_dict()}
+                                               for c in result.output.approvals]})
+        return JSONResponse({"answer": result.output, "tools": tools, "source": src})
     except Exception as e:
         ref = _secrets.token_hex(4)
         print(f"[chat-error {ref}] {type(e).__name__}: {e}")   # detail server-side only
@@ -716,9 +740,16 @@ def _source_form(c, typ):
     pr = "checked" if (c and c.get("is_primary")) else ""
     fields_html += (f'<label><input type="checkbox" name="enabled" {en} style="width:auto"> Enabled</label>'
                     f'<label><input type="checkbox" name="is_primary" {pr} style="width:auto"> Primary</label>')
+    extra = ""
+    if c and typ == "external_mcp":
+        extra = ('<div class="panel"><h2>Remote tools</h2>'
+                 '<p class="sub">List what this server exposes, and whether each tool already has '
+                 'a registry row.</p>'
+                 f'<form method="post" action="/admin/sources/{ui.esc(c["id"])}/discover">'
+                 '<button class="btn">Discover tools</button></form></div>')
     return (f'<div class="panel"><form method="post" action="/admin/sources/save">{fields_html}'
             f'<br><button class="btn">Save source</button> '
-            f'<a class="btn grey" href="/admin/sources">Cancel</a></form></div>')
+            f'<a class="btn grey" href="/admin/sources">Cancel</a></form></div>' + extra)
 
 
 @app.get("/admin/sources/new", response_class=HTMLResponse)
@@ -757,6 +788,7 @@ async def admin_source_save(request: Request):
     if form.get("id"):
         d["id"] = form.get("id")
     connectors.upsert(d)
+    mcp_sources.invalidate(d.get("id"))     # a cached toolset holds the old URL/token
     return RedirectResponse("/admin/sources?msg=Saved", status_code=303)
 
 
@@ -774,6 +806,29 @@ async def admin_source_test(request: Request, cid: str):
     return RedirectResponse(f'/admin/sources?err={quote(str(r.get("error","failed")))}', status_code=303)
 
 
+@app.post("/admin/sources/{cid}/discover")
+async def admin_source_discover(request: Request, cid: str):
+    g = _admin_guard(request)
+    if g:
+        return g
+    c = connectors.get(cid)
+    if not c or c["type"] != "external_mcp":
+        return RedirectResponse("/admin/sources?err=Not+an+external+MCP+source", status_code=303)
+    d = await mcp_sources.discover(c)
+    if not d["ok"]:
+        return RedirectResponse(f'/admin/sources?err={quote(str(d["error"]))}', status_code=303)
+    rows = [[ui.esc(x["name"]), ui.esc((x["description"] or "")[:90]),
+             ui.badge("in registry", "ok") if x["registered"] else ui.badge("not registered", "off")]
+            for x in d["tools"]]
+    body = (f'<h1>Tools on {ui.esc(c["name"])}</h1>'
+            '<p class="sub">Remote tools are namespaced with this source&#39;s prefix. A tool only '
+            'reaches the agent once it has an <b>enabled</b> registry row under its prefixed name, '
+            'allowed for the caller&#39;s role — mounting a server grants nothing by itself.</p>'
+            + ui.table(["Tool", "Description", "Status"], rows)
+            + '<a class="btn grey" href="/admin/sources">Back to sources</a>')
+    return _admin_page(request, "/admin/sources", "Discover MCP Tools", body)
+
+
 @app.post("/admin/sources/{cid}/primary")
 async def admin_source_primary(request: Request, cid: str):
     g = _admin_guard(request)
@@ -789,6 +844,7 @@ async def admin_source_delete(request: Request, cid: str):
     if g:
         return g
     connectors.delete(cid)
+    mcp_sources.invalidate(cid)
     return RedirectResponse("/admin/sources?msg=Deleted", status_code=303)
 
 
@@ -814,15 +870,27 @@ def _tool_form(t):
             'cache, PII and enable/disable.</div>' if builtin else
             '<div class="banner">Config tool — define it entirely here; it becomes callable by the agent '
             'immediately, no code or restart.</div>')
+    aschema = json.dumps(registry.args_of(t)) if t else \
+        '[{"name": "person_id", "type": "string", "required": true, "description": ""}]'
     adv = "" if builtin else (
-        f'<label>Kind</label>{sel("kind", ["oracle_child", "oracle_search", "oracle_detail"], t["kind"] if t else "oracle_child")}'
-        f'<label>Argument the agent supplies</label>{sel("arg", ["person_id", "query"], t["arg"] if t else "person_id")}'
+        f'<label>Kind</label>{sel("kind", ["oracle_child", "oracle_search", "oracle_detail", "external"], t["kind"] if t else "oracle_child")}'
+        f'<label>HTTP method — <span class="mono">external</span> tools only. Anything other than '
+        f'<span class="mono">GET</span> is a write: it is never cached, and the agent can call it '
+        f'on its own, so grant it narrowly.</label>{sel("method", list(registry.METHODS), t["method"] if t else "GET")}'
+        f'<label>Arguments the agent supplies — JSON list of '
+        f'<span class="mono">{{"name","type","required","description"}}</span>. '
+        f'The description is what the model reads to fill the argument in.</label>'
+        f'<textarea name="args_schema" rows="3" class="mono">{ui.esc(aschema)}</textarea>'
         f'<label>Endpoint — child resource for oracle_child (e.g. <span class="mono">absences</span>, '
-        f'<span class="mono">salaries</span>, <span class="mono">phones</span>)</label>'
+        f'<span class="mono">salaries</span>, <span class="mono">phones</span>); for '
+        f'<span class="mono">external</span>, a path under the source&#39;s base URL '
+        f'(e.g. <span class="mono">api/now/table/hr_case</span>)</label>'
         f'<input name="endpoint" value="{ui.esc(t["endpoint"]) if t else ""}">'
         f'<label>Params (JSON)</label><textarea name="params" rows="2" class="mono">{ui.esc(params)}</textarea>'
         f'<label>Result map (JSON <span class="mono">{{"OutLabel":"OracleField"}}</span>, empty = raw)</label>'
-        f'<textarea name="result_map" rows="2" class="mono">{ui.esc(rmap)}</textarea>')
+        f'<textarea name="result_map" rows="2" class="mono">{ui.esc(rmap)}</textarea>'
+        f'<label style="display:inline-block"><input type="checkbox" name="namespaced" '
+        f'{"checked" if (t and t["namespaced"]) else ""} style="width:auto"> Namespaced (non-Oracle source)</label>')
     return (note + '<div class="panel"><form method="post" action="/admin/tools/save">'
             f'<label>Tool name</label>{name_field}'
             f'<label>Description (the agent uses this to decide when to call it)</label>'
@@ -890,9 +958,20 @@ async def admin_tool_save(request: Request):
          "allowed_roles": [r for r in ("employee", "manager", "hr_admin") if form.get(f"role_{r}")],
          "cache_ttl": form.get("cache_ttl") or 300, "pii_level": form.get("pii_level") or "low",
          "enabled": 1 if form.get("enabled") else 0}
-    for k in ("kind", "arg", "endpoint"):
+    for k in ("kind", "arg", "endpoint", "method"):
         if form.get(k) is not None:
             d[k] = form.get(k)
+    if form.get("kind") is not None:            # the advanced block was rendered (config tool)
+        d["namespaced"] = 1 if form.get("namespaced") else 0
+    aschema = form.get("args_schema")
+    if aschema is not None:
+        try:
+            parsed = json.loads(aschema or "[]")
+            if not isinstance(parsed, list):
+                raise ValueError("args_schema must be a list")
+        except Exception:
+            return RedirectResponse("/admin/tools?err=Invalid+JSON+in+args_schema", status_code=303)
+        d["args_schema"] = parsed
     for k in ("params", "result_map"):
         v = form.get(k)
         if v is not None:
@@ -932,6 +1011,45 @@ async def admin_tool_delete(request: Request, name: str):
     return RedirectResponse("/admin/tools?err=Cannot+delete+a+built-in+tool", status_code=303)
 
 
+def _tool_test_form(t):
+    """Run a config tool with sample arguments. The scripted demo brain can't reach
+    config tools at all, so without this an admin only finds out a definition is
+    wrong by wiring it into a real chat."""
+    if t["builtin"]:
+        return ""
+    ins = "".join(
+        f'<label>{ui.esc(a["name"])}{"" if a["required"] else " (optional)"}</label>'
+        f'<input name="arg_{ui.esc(a["name"])}" placeholder="{ui.esc(a["description"] or a["type"])}">'
+        for a in registry.args_of(t))
+    return ('<div class="panel"><h2>Test this tool</h2>'
+            '<p class="sub">Runs the definition against the current source and shows the raw '
+            'result. Governance and the audit log apply exactly as they do in chat.</p>'
+            f'<form method="post" action="/admin/tools/{ui.esc(t["name"])}/test">{ins}'
+            '<br><button class="btn">Run test</button></form></div>')
+
+
+@app.post("/admin/tools/{name}/test")
+async def admin_tool_test(request: Request, name: str):
+    g = _admin_guard(request)
+    if g:
+        return g
+    t = registry.get(name)
+    if not t or t["builtin"]:
+        return RedirectResponse("/admin/tools?err=Only+config+tools+can+be+tested", status_code=303)
+    form = await request.form()
+    args = {a["name"]: form.get("arg_" + a["name"]) for a in registry.args_of(t)
+            if form.get("arg_" + a["name"]) not in (None, "")}
+    try:
+        out = json.dumps(await sources.run_custom(name, **args), indent=2, default=str)[:4000]
+    except Exception as e:
+        out = f"{type(e).__name__}: {e}"
+    return _admin_page(request, "/admin/tools", "Test MCP Tool",
+                       f'<h1>Tool · {ui.esc(name)}</h1>'
+                       f'<div class="banner">Ran with {ui.esc(json.dumps(args))}</div>'
+                       f'<div class="panel"><pre class="mono">{ui.esc(out)}</pre></div>'
+                       f'<a class="btn grey" href="/admin/tools/{ui.esc(name)}">Back to tool</a>')
+
+
 @app.get("/admin/tools/{name}", response_class=HTMLResponse)
 async def admin_tool_detail(request: Request, name: str):
     g = _admin_guard(request)
@@ -942,7 +1060,8 @@ async def admin_tool_detail(request: Request, name: str):
         return RedirectResponse("/admin/tools?err=Unknown+tool", status_code=303)
     return _admin_page(request, "/admin/tools", "Edit MCP Tool",
                        f'<h1>Tool · {ui.esc(t["name"])}</h1>'
-                       f'<p class="sub mono">{ui.esc(t["rest_mapping"])}</p>' + _tool_form(t))
+                       f'<p class="sub mono">{ui.esc(t["rest_mapping"])}</p>'
+                       + _tool_form(t) + _tool_test_form(t))
 
 
 @app.get("/admin/models", response_class=HTMLResponse)

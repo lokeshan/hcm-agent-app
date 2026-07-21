@@ -6,7 +6,19 @@ needing a Gemini API key. Uses Pydantic AI's FunctionModel to script tool calls.
     python smoke_test.py
 """
 from __future__ import annotations
-import asyncio
+import asyncio, os, sys, tempfile
+from pathlib import Path
+
+# Pin to a throwaway DB with the mock source primary. Without this the test runs
+# against whatever connector the developer left primary, so a live Oracle pod makes
+# it fail on real staff data rather than the "Jane Doe" it asserts.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import config
+config.DB_PATH = Path(tempfile.gettempdir()) / "hcm_smoke.db"
+if config.DB_PATH.exists():
+    config.DB_PATH.unlink()
+import connectors
+connectors.list_all(); connectors.set_primary("mock")
 
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, ToolCallPart, TextPart
@@ -50,7 +62,7 @@ async def main() -> int:
 
     ok = ("search_workers" in tool_calls and "get_worker" in tool_calls
           and any("Jane Doe" in c for _, c in tool_returns))
-    print("RESULT:", "PASS ✅" if ok else "FAIL ❌")
+    print("RESULT:", "PASS" if ok else "FAIL")   # ASCII: cp1252 consoles choke on emoji
     return 0 if ok else 1
 
 

@@ -8,8 +8,21 @@ from __future__ import annotations
 import json, sqlite3, uuid
 
 import config
+import conn_types
 
-SECRET_FIELDS = ("password", "client_secret")
+
+def _secret_fields() -> tuple:
+    """Which config keys hold secrets. Derived from the connector-type catalogue —
+    any field a type renders as a password input is masked in the UI and preserved
+    when the form posts it back blank. Kept in one place so adding a connector type
+    with a credential can't silently forget to mask it."""
+    out = {"password", "client_secret"}   # legacy keys, masked even if no type declares them
+    for meta in conn_types.TYPES.values():
+        out.update(f["key"] for f in meta.get("fields", []) if f.get("type") == "password")
+    return tuple(sorted(out))
+
+
+SECRET_FIELDS = _secret_fields()
 
 
 def _conn():

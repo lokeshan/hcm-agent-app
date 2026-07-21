@@ -7,10 +7,11 @@ try:
 except Exception:
     pass
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests
 from pydantic_ai.mcp import MCPToolset
 
 import config
+import mcp_sources
 import tools_registry as registry
 from hcm_mcp_server import mcp as hcm_mcp, sync_custom_tools
 
@@ -90,7 +91,24 @@ def build_agent(model=None, identity: dict | None = None) -> Agent:
     # The scripted demo brain calls tools by name, so we DON'T filter there —
     # the in-tool governance wrapper still enforces + audits every call.
     filter_role = None if is_demo() else role
-    return Agent(model, toolsets=[hcm_toolset(filter_role)], instructions=instr)
+    ts = hcm_toolset(filter_role)
+    # A write tool can be invoked by the model on its own reading of a sentence, so
+    # require the human to confirm it. Governance decides who MAY call a tool; this
+    # decides that this particular call happens now. Reads are untouched.
+    writes = registry.write_tool_names()
+    if writes:
+        ts = ts.approval_required(lambda ctx, td, args: td.name in writes)
+    toolsets = [ts]
+    # External MCP servers: always role-filtered (the demo brain doesn't know them),
+    # and never allowed to break chat — a broken server just contributes no tools.
+    try:
+        toolsets += mcp_sources.toolsets_for_agent(role)
+    except Exception as e:
+        print("[mcp] external toolsets unavailable:", type(e).__name__, e)
+    # DeferredToolRequests lets a run end by ASKING rather than answering; the chat
+    # endpoint turns that into an approve/cancel prompt and resumes from history.
+    return Agent(model, toolsets=toolsets, instructions=instr,
+                 output_type=[str, DeferredToolRequests])
 
 
 def is_demo() -> bool:

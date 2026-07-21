@@ -19,6 +19,8 @@ import config
 ALL_ROLES = "employee,manager,hr_admin"
 ROLES = ("employee", "manager", "hr_admin")
 KINDS = ("builtin", "oracle_search", "oracle_child", "oracle_detail", "external")
+METHODS = ("GET", "POST", "PATCH", "PUT", "DELETE")
+ARG_TYPES = ("string", "integer", "number", "boolean")
 
 # The 6 tools that have hardcoded implementations (never dynamically registered).
 BUILTIN_NAMES = {"search_workers", "get_worker", "get_assignment",
@@ -64,11 +66,11 @@ def _conn():
                  (name TEXT PRIMARY KEY, source_type TEXT, enabled INTEGER, allowed_roles TEXT,
                   cache_ttl INTEGER, pii_level TEXT, namespaced INTEGER, description TEXT,
                   rest_mapping TEXT, kind TEXT, method TEXT, endpoint TEXT, params TEXT,
-                  result_map TEXT, arg TEXT, builtin INTEGER)""")
+                  result_map TEXT, arg TEXT, builtin INTEGER, args_schema TEXT DEFAULT '')""")
     # migrate older DBs that predate the config columns
     for col, default in (("kind", "'builtin'"), ("method", "'GET'"), ("endpoint", "''"),
                          ("params", "'{}'"), ("result_map", "'{}'"), ("arg", "'person_id'"),
-                         ("builtin", "1")):
+                         ("builtin", "1"), ("args_schema", "''")):
         try:
             c.execute(f"ALTER TABLE tools ADD COLUMN {col} TEXT DEFAULT {default}")
         except sqlite3.OperationalError:
@@ -105,11 +107,44 @@ def _row(r) -> dict:
             "cache_ttl": r[4], "pii_level": r[5], "namespaced": _truthy(r[6]),
             "description": r[7], "rest_mapping": r[8], "kind": r[9] or "builtin",
             "method": r[10] or "GET", "endpoint": r[11] or "", "params": _jload(r[12], {}),
-            "result_map": _jload(r[13], {}), "arg": r[14] or "person_id", "builtin": _truthy(r[15])}
+            "result_map": _jload(r[13], {}), "arg": r[14] or "person_id", "builtin": _truthy(r[15]),
+            "args_schema": _jload(r[16] if len(r) > 16 else "", [])}
 
 
 _COLS = ("name,source_type,enabled,allowed_roles,cache_ttl,pii_level,namespaced,description,"
-         "rest_mapping,kind,method,endpoint,params,result_map,arg,builtin")
+         "rest_mapping,kind,method,endpoint,params,result_map,arg,builtin,args_schema")
+
+
+def args_of(t: dict) -> list:
+    """A tool's argument list, normalised. Falls back to the legacy single `arg`
+    column so every tool defined before multi-arg keeps working untouched."""
+    out = []
+    for it in (t.get("args_schema") or []):
+        if isinstance(it, str):
+            it = {"name": it}
+        nm = str((it or {}).get("name") or "").strip()
+        if nm:
+            out.append({"name": nm, "type": it.get("type") or "string",
+                        "required": bool(it.get("required", True)),
+                        "description": it.get("description") or ""})
+    return out or [{"name": t.get("arg") or "person_id", "type": "string",
+                    "required": True, "description": ""}]
+
+
+def json_schema(t: dict) -> dict:
+    """MCP inputSchema for a config tool. fastmcp normally derives this from a
+    Python signature, which caps a tool at the arguments we hard-coded; building it
+    here is what lets an admin declare any number of them."""
+    props, req = {}, []
+    for a in args_of(t):
+        p = {"type": a["type"] if a["type"] in ARG_TYPES else "string"}
+        if a["description"]:
+            p["description"] = a["description"]
+        props[a["name"]] = p
+        if a["required"]:
+            req.append(a["name"])
+    return {"type": "object", "properties": props, "required": req,
+            "additionalProperties": False}
 
 
 def list_all() -> list:
@@ -128,7 +163,7 @@ def get(name: str) -> dict | None:
 
 def custom_enabled() -> list:
     """Enabled, non-builtin tools that should be dynamically registered with MCP."""
-    return [t for t in list_all() if t["enabled"] and not t["builtin"] and t["kind"] != "external"]
+    return [t for t in list_all() if t["enabled"] and not t["builtin"]]
 
 
 def upsert(d: dict) -> dict:
@@ -146,6 +181,14 @@ def upsert(d: dict) -> dict:
     kind = "builtin" if builtin else (d.get("kind") or (existing["kind"] if existing else "oracle_child"))
     params = d.get("params"); params = json.dumps(params) if isinstance(params, (dict, list)) else (params or "{}")
     rmap = d.get("result_map"); rmap = json.dumps(rmap) if isinstance(rmap, (dict, list)) else (rmap or "{}")
+    aschema = d.get("args_schema")
+    if isinstance(aschema, (list, tuple)):
+        aschema = json.dumps([a for a in aschema if a])
+    elif aschema is None:
+        aschema = json.dumps(existing["args_schema"]) if (existing and existing["args_schema"]) else ""
+    else:
+        aschema = str(aschema or "")
+    method = str(d.get("method", existing["method"] if existing else "GET")).upper()
     row = {
         "name": name,
         "source_type": d.get("source_type", existing["source_type"] if existing else "oracle_hcm"),
@@ -156,22 +199,24 @@ def upsert(d: dict) -> dict:
         "namespaced": int(d.get("namespaced", existing["namespaced"] if existing else 0)),
         "description": d.get("description", existing["description"] if existing else ""),
         "rest_mapping": d.get("rest_mapping", existing["rest_mapping"] if existing else ""),
-        "kind": kind, "method": d.get("method", existing["method"] if existing else "GET"),
+        "kind": kind, "method": method if method in METHODS else "GET",
         "endpoint": d.get("endpoint", existing["endpoint"] if existing else ""),
         "params": params, "result_map": rmap,
         "arg": d.get("arg", existing["arg"] if existing else "person_id"),
-        "builtin": builtin,
+        "builtin": builtin, "args_schema": aschema,
     }
     c = _conn()
-    c.execute(f"INSERT INTO tools({_COLS}) VALUES({','.join('?'*16)}) "
+    c.execute(f"INSERT INTO tools({_COLS}) VALUES({','.join('?'*17)}) "
               "ON CONFLICT(name) DO UPDATE SET source_type=excluded.source_type,enabled=excluded.enabled,"
               "allowed_roles=excluded.allowed_roles,cache_ttl=excluded.cache_ttl,pii_level=excluded.pii_level,"
               "namespaced=excluded.namespaced,description=excluded.description,rest_mapping=excluded.rest_mapping,"
               "kind=excluded.kind,method=excluded.method,endpoint=excluded.endpoint,params=excluded.params,"
-              "result_map=excluded.result_map,arg=excluded.arg,builtin=excluded.builtin",
+              "result_map=excluded.result_map,arg=excluded.arg,builtin=excluded.builtin,"
+              "args_schema=excluded.args_schema",
               tuple(row[k] for k in ("name", "source_type", "enabled", "allowed_roles", "cache_ttl",
                                      "pii_level", "namespaced", "description", "rest_mapping", "kind",
-                                     "method", "endpoint", "params", "result_map", "arg", "builtin")))
+                                     "method", "endpoint", "params", "result_map", "arg", "builtin",
+                                     "args_schema")))
     c.commit(); c.close()
     return get(name)
 
@@ -199,6 +244,14 @@ def set_allowed(name: str, roles: list):
 def set_ttl(name: str, ttl: int):
     c = _conn(); c.execute("UPDATE tools SET cache_ttl=? WHERE name=?", (int(ttl), name))
     c.commit(); c.close()
+
+
+def write_tool_names() -> set:
+    """Enabled tools that CHANGE data in a connected system (anything not a GET).
+    The model can decide to call these on its own, so chat gates them behind an
+    explicit user approval — governance says *may*, approval says *now*."""
+    return {t["name"] for t in list_all()
+            if t["enabled"] and str(t.get("method") or "GET").upper() != "GET"}
 
 
 def allowed_names_for_role(role: str) -> set:

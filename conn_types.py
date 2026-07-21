@@ -49,10 +49,17 @@ TYPES = {
     },
     "external_mcp": {
         "label": "External MCP server",
-        "status": "planned",
-        "blurb": "Mount a third-party MCP server; its tools surface namespaced per source.",
+        "status": "available",
+        "blurb": "Mount a third-party MCP server; its tools surface namespaced per source. "
+                 "Each remote tool still needs an enabled tool-registry row under its prefixed name.",
         "fields": [
-            {"key": "mcp_url", "label": "MCP server URL / command", "type": "text"},
+            {"key": "mcp_url", "label": "MCP server URL / script path", "type": "text",
+             "placeholder": "https://example.com/mcp"},
+            {"key": "mcp_auth", "label": "Auth", "type": "select",
+             "options": ["none", "bearer", "oauth"]},
+            {"key": "mcp_token", "label": "Bearer token / API key", "type": "password"},
+            {"key": "mcp_prefix", "label": "Tool name prefix", "type": "text",
+             "placeholder": "workday"},
         ],
     },
 }

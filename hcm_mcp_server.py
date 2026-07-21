@@ -7,11 +7,13 @@ Each tool:
   3. is timed and written to the audit log.
 """
 from __future__ import annotations
+import json
 import time
 import threading
 
 from fastmcp import FastMCP
-from fastmcp.tools import Tool
+from fastmcp.tools import Tool, ToolResult
+from pydantic import ConfigDict
 
 import sources
 import identity
@@ -40,6 +42,10 @@ async def _run(name: str, coro, target_ref: str = ""):
     who = u.get("email") or u.get("display_name") or "anonymous"
     allowed, reason = registry.check(name, role)
     if not allowed:
+        # callers build the coroutine eagerly (_run(name, sources.x(...))), so on the
+        # deny path it is never awaited — close it or every denial leaks a coroutine
+        # and emits "coroutine was never awaited".
+        coro.close()
         audit_store.log(who, role, name, _source_name(), target_ref, f"denied:{reason}", 0)
         return registry.deny_value(name)
     t0 = time.time()
@@ -91,16 +97,19 @@ async def get_management_chain(person_id: str) -> list:
     return _clean(await _run("get_management_chain", sources.get_management_chain(person_id), person_id))
 
 
-def _make_handler(name: str, arg: str):
-    """Build a governed+audited handler for a CONFIG tool with the right signature."""
-    if arg == "query":
-        async def handler(query: str) -> list:
-            return await _run(name, sources.run_custom(name, query=query), query)
-    else:
-        async def handler(person_id: str):
-            return await _run(name, sources.run_custom(name, person_id=person_id), person_id)
-    handler.__name__ = name
-    return handler
+class _ConfigTool(Tool):
+    """A UI-defined tool. fastmcp normally derives a tool's schema from a Python
+    function signature, which would cap us at the argument names we hard-coded;
+    supplying `parameters` directly is the supported alternative (fastmcp's own
+    TransformedTool does the same) and is what lets an admin declare any number
+    of arguments. Governance + audit still run through the shared _run wrapper."""
+    model_config = ConfigDict(extra="allow", arbitrary_types_allowed=True)
+
+    async def run(self, arguments: dict) -> ToolResult:
+        args = {k: v for k, v in (arguments or {}).items() if v is not None}
+        ref = ", ".join(f"{k}={v}" for k, v in sorted(args.items()))[:200]
+        out = await _run(self.name, sources.run_custom(self.name, **args), ref)
+        return ToolResult(out if out is not None else {})
 
 
 def _remove(n):
@@ -124,14 +133,14 @@ def sync_custom_tools():
                 _remove(n)
                 _registered.pop(n, None)
         for n, cfg in want.items():
-            sig = (cfg["arg"], cfg["description"])
+            sig = (json.dumps(registry.json_schema(cfg), sort_keys=True), cfg["description"])
             if _registered.get(n) == sig:
                 continue
             if n in _registered:
                 _remove(n)
             try:
-                fn = _make_handler(n, cfg["arg"])
-                mcp.add_tool(Tool.from_function(fn, name=n, description=cfg["description"] or n))
+                mcp.add_tool(_ConfigTool(name=n, description=cfg["description"] or n,
+                                         parameters=registry.json_schema(cfg)))
                 _registered[n] = sig
             except Exception as e:
                 print("[mcp] could not register custom tool", n, ":", e)
