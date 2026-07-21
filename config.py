@@ -4,6 +4,7 @@ Holds AI model settings, Oracle HCM connection (Basic or OAuth2), data source,
 and cache settings. Secrets are local; use a vault in production.
 """
 from __future__ import annotations
+import crypto
 import json, os, sqlite3
 from pathlib import Path
 
@@ -54,6 +55,7 @@ DEFAULTS = {
 }
 DEFAULT_MODELS = {"google": "gemini-2.0-flash", "openai": "gpt-4o", "anthropic": "claude-3-5-sonnet-latest", "demo": ""}
 _SECRET_KEYS = ("ai_api_key", "hcm_password", "hcm_client_secret")
+_sealed = False
 
 
 def tune(conn: sqlite3.Connection) -> sqlite3.Connection:
@@ -80,9 +82,25 @@ def _read_all(conn) -> dict:
 def _write(conn, cfg: dict) -> None:
     for k in DEFAULTS:
         v = cfg.get(k, "")
+        v = "" if v is None else str(v)
+        if k in _SECRET_KEYS and v:
+            v = crypto.enc(v)
         conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                     (k, "" if v is None else str(v)))
+                     (k, v))
     conn.commit()
+
+
+def _seal(conn, raw: dict) -> None:
+    """One-time upgrade of a database written before secrets were encrypted."""
+    global _sealed
+    _sealed = True
+    todo = {k: raw[k] for k in _SECRET_KEYS if raw.get(k) and not crypto.is_sealed(raw[k])}
+    if not todo:
+        return
+    for k, v in todo.items():
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (crypto.enc(v), k))
+    conn.commit()
+    print("[config] encrypted at rest:", ", ".join(sorted(todo)))
 
 
 def _migrate(conn) -> None:
@@ -100,9 +118,12 @@ def load() -> dict:
     cfg = dict(DEFAULTS)
     try:
         conn = _connect(); _migrate(conn)
-        for k, v in _read_all(conn).items():
+        raw = _read_all(conn)
+        if not _sealed:
+            _seal(conn, raw)
+        for k, v in raw.items():
             if k in DEFAULTS:
-                cfg[k] = v
+                cfg[k] = crypto.dec(v) if k in _SECRET_KEYS else v
         conn.close()
     except Exception:
         pass

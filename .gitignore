@@ -17,3 +17,6 @@ HR_Assistant_demo.png
 *.png
 .secret_key
 raw_findings.md
+.playwright-mcp/
+*.db.bak*
+.secret_key.*

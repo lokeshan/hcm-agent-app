@@ -9,3 +9,4 @@ python-multipart>=0.0.9,<1                                # form posts (admin co
 httpx>=0.27,<1                                             # live Oracle HCM REST calls
 truststore>=0.9,<1                                        # trust OS/corporate CA (enterprise SSL)
 python-dotenv>=1.0,<2                                      # load .env at startup
+cryptography>=42,<50                                       # encrypt secrets at rest (crypto.py)

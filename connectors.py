@@ -9,6 +9,7 @@ import json, sqlite3, uuid
 
 import config
 import conn_types
+import crypto
 
 
 def _secret_fields() -> tuple:
@@ -34,13 +35,40 @@ def _conn():
 
 
 def _row(r) -> dict:
+    cfg = json.loads(r[5] or "{}")
+    for k in SECRET_FIELDS:                      # legacy plaintext passes through
+        if k in cfg:
+            cfg[k] = crypto.dec(cfg[k])
     return {"id": r[0], "name": r[1], "type": r[2], "enabled": bool(r[3]),
-            "is_primary": bool(r[4]), "config": json.loads(r[5] or "{}")}
+            "is_primary": bool(r[4]), "config": cfg}
+
+
+_sealed = False
+
+
+def _seal(c) -> None:
+    """One-time upgrade for connectors stored before secrets were encrypted."""
+    global _sealed
+    _sealed = True
+    done = []
+    for cid, raw in c.execute("SELECT id, config FROM connectors").fetchall():
+        cfg = json.loads(raw or "{}")
+        todo = {k: v for k, v in cfg.items() if k in SECRET_FIELDS and v and not crypto.is_sealed(v)}
+        if not todo:
+            continue
+        cfg.update({k: crypto.enc(v) for k, v in todo.items()})
+        c.execute("UPDATE connectors SET config=? WHERE id=?", (json.dumps(cfg), cid))
+        done.append(cid)
+    if done:
+        c.commit()
+        print("[connectors] encrypted at rest:", ", ".join(done))
 
 
 def list_all() -> list:
     c = _conn()
     _seed(c)
+    if not _sealed:
+        _seal(c)
     rows = [_row(r) for r in c.execute(
         "SELECT id,name,type,enabled,is_primary,config FROM connectors ORDER BY is_primary DESC, name")]
     c.close()
@@ -69,10 +97,11 @@ def upsert(d: dict) -> dict:
     enabled = int(d.get("enabled", existing["enabled"] if existing else True))
     primary = int(d.get("is_primary", existing["is_primary"] if existing else False))
     c = _conn()
+    stored = {k: (crypto.enc(v) if (k in SECRET_FIELDS and v) else v) for k, v in cfg.items()}
     c.execute("INSERT INTO connectors(id,name,type,enabled,is_primary,config) VALUES(?,?,?,?,?,?) "
               "ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,"
               "enabled=excluded.enabled,is_primary=excluded.is_primary,config=excluded.config",
-              (cid, name, typ, enabled, primary, json.dumps(cfg)))
+              (cid, name, typ, enabled, primary, json.dumps(stored)))
     c.commit(); c.close()
     if primary:
         set_primary(cid)

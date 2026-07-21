@@ -58,6 +58,7 @@ _SEED = [
 ]
 
 _LIST_KINDS = {"oracle_search", "oracle_child"}
+_repaired = False
 
 
 def _conn():
@@ -76,7 +77,41 @@ def _conn():
         except sqlite3.OperationalError:
             pass
     c.commit()
+    _repair_builtin(c)
     return c
+
+
+def _repair_builtin(c):
+    """`ALTER TABLE ... builtin DEFAULT 1` stamps EVERY pre-existing row as builtin —
+    SQLite has no conditional default — so on a database predating the config columns,
+    config tools like get_compensation came out flagged builtin. That made them
+    undeletable, uneditable, and invisible to custom_enabled(): enabling one in the UI
+    appeared to work and did nothing, because there is no hardcoded implementation to
+    fall back on. Only the six names in BUILTIN_NAMES are ever builtin; reset the rest
+    and restore their real definition from the seed."""
+    global _repaired
+    if _repaired:
+        return
+    _repaired = True
+    try:
+        rows = c.execute("SELECT name FROM tools WHERE builtin NOT IN ('0', 0)").fetchall()
+    except sqlite3.OperationalError:
+        return
+    wrong = [r[0] for r in rows if r[0] not in BUILTIN_NAMES]
+    if not wrong:
+        return
+    seed = {s[0]: s for s in _SEED}
+    for name in wrong:
+        s = seed.get(name)
+        if s:   # restore kind/method/endpoint/params/result_map/arg/namespaced/mapping
+            c.execute("UPDATE tools SET builtin=0, kind=?, method=?, endpoint=?, params=?, "
+                      "result_map=?, arg=?, namespaced=?, rest_mapping=? WHERE name=?",
+                      (s[9], s[10], s[11], s[12], s[13], s[14], s[6], s[8], name))
+        else:   # legacy config tool with no seed: un-flag it so it is at least editable
+            c.execute("UPDATE tools SET builtin=0, kind='oracle_child' "
+                      "WHERE name=? AND kind='builtin'", (name,))
+    c.commit()
+    print("[tools] repaired builtin flag on:", ", ".join(wrong))
 
 
 def _seed(c):
@@ -172,7 +207,9 @@ def upsert(d: dict) -> dict:
     if not name:
         raise ValueError("tool name required")
     existing = get(name)
-    builtin = 1 if (name in BUILTIN_NAMES or (existing and existing["builtin"])) else 0
+    # BUILTIN_NAMES is the only authority. Deriving this from the stored flag instead
+    # let a wrongly-migrated row stay builtin forever (see _repair_builtin).
+    builtin = 1 if name in BUILTIN_NAMES else 0
     roles = d.get("allowed_roles")
     if isinstance(roles, (list, tuple)):
         roles = ",".join(r for r in roles if r in ROLES)
